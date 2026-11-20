@@ -145,6 +145,61 @@ def run(flow):
                           "duplicate": rejected(lambda: db.transfer.import_lines("copy_segments", exported["lines"]), Conflict)}
                 if len(db.query("copy_segments").records) != 6:
                     raise RuntimeError("logical import differs")
+            elif flow == "trigger":
+                db.catalog.create("rollups", {"fields": {"region": "string", "total": "integer"},
+                                               "required": ["region", "total"]})
+                db.catalog.create("audits", {"fields": {"order_key": "string", "amount": "integer"},
+                                             "required": ["order_key"]})
+                db.catalog.create("ring_a", {"fields": {"n": "integer", "k": "string"}})
+                db.catalog.create("ring_b", {"fields": {"n": "integer", "k": "string"}})
+                registered = db.rules.register({
+                    "name": "segment_rollup", "source": "segments", "events": ["put"],
+                    "predicate": {"field": "region", "op": "eq", "value": "east"},
+                    "action": "upsert", "target": "rollups", "target_key": "rollup_${region}",
+                    "template": {"region": {"$field": "region"}, "total": {"$field": "sequence"}},
+                })
+                db.rules.register({
+                    "name": "segment_audit", "source": "segments", "events": ["put"],
+                    "action": "upsert", "target": "audits", "target_key": "audit_${key}",
+                    "template": {"order_key": {"$key": True}, "amount": {"$field": "sequence"}},
+                })
+                commit = db.batch("triggered_seed").put(
+                    "segments", "seg_99", {"region": "east", "sequence": 42, "code": "c99"}).commit()
+                replay = db.batch("triggered_seed").put(
+                    "segments", "seg_99", {"region": "east", "sequence": 42, "code": "c99"}).commit()
+                if db.get("rollups", "rollup_east") is None or db.get("audits", "audit_seg_99") is None:
+                    raise RuntimeError("derived records were not created")
+                if not replay.replayed or replay.derived != commit.derived:
+                    raise RuntimeError("idempotent replay changed the derived result")
+                replaced = db.rules.register({
+                    "name": "segment_rollup", "source": "segments", "events": ["put"],
+                    "predicate": {"field": "region", "op": "eq", "value": "east"},
+                    "action": "upsert", "target": "rollups", "target_key": "rollup_${region}",
+                    "template": {"region": {"$field": "region"}, "total": {"$field": "sequence"}, "tag": "v2"},
+                }, expected_version=registered["version"])
+                history = [{"version": item["version"], "state": item["state"]}
+                           for item in db.rules.history("segment_rollup")]
+                # A rule graph cycle must fail closed and leave no partial writes.
+                db.rules.register({"name": "ring_forward", "source": "ring_a", "events": ["put"],
+                                   "action": "upsert", "target": "ring_b", "target_key": "b_${key}",
+                                   "template": {"n": {"$field": "n"}, "k": {"$key": True}}})
+                db.rules.register({"name": "ring_back", "source": "ring_b", "events": ["put"],
+                                   "action": "upsert", "target": "ring_a", "target_key": "a_${key}",
+                                   "template": {"n": {"$field": "n"}, "k": {"$key": True}}})
+                head_before = db.revision
+                cycle = rejected(lambda: db.batch().put("ring_a", "seed", {"n": 0, "k": "seed"}).commit(), Conflict)
+                if db.revision != head_before or db.get("ring_a", "seed") is not None:
+                    raise RuntimeError("cycle did not roll back the whole commit")
+                db.rules.disable("ring_forward")
+                db.rules.disable("ring_back")
+                feed = db.feed.read(commit.revision - 1, limit=1)
+                output = {"commit": commit.__dict__, "replay": replay.__dict__,
+                          "rollup": db.get("rollups", "rollup_east").document,
+                          "audit": db.get("audits", "audit_seg_99").document,
+                          "replacement": replaced, "history": history, "cycle": cycle,
+                          "explain": db.rules.explain("segment_rollup"),
+                          "payload": {"derived": feed[0]["derived"], "trace": feed[0]["trace"],
+                                      "origins": [op["origin"] for op in feed[0]["operations"] if op["origin"]]}}
             else:
                 raise ValueError("unknown example workflow: " + flow)
             print(json.dumps({"workflow": flow, "result": output}, ensure_ascii=False, sort_keys=True, default=str))

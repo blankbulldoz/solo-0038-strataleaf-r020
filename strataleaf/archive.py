@@ -21,7 +21,8 @@ def inspect_archive(path):
     try:
         result = connection.execute("PRAGMA integrity_check").fetchone()[0]
         values = dict(connection.execute("SELECT key,value FROM meta"))
-        required = {"head", "floor", "format", "database_id", "cursor_secret", "mode", "upstream"}
+        required = {"head", "floor", "format", "database_id", "cursor_secret", "mode",
+                    "upstream", "catalog_epoch", "rule_epoch"}
         if result != "ok" or not required.issubset(values) or values["format"] != "1":
             raise DatabaseError("archive is not a supported intact database")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:

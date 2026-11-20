@@ -4,8 +4,10 @@ from .errors import (DatabaseError, InvalidDocument, Conflict, NotFound, Snapsho
                      InvalidCursor, ReadOnly, ReplicationError)
 from .mvcc import Record
 from .query import Page
+from .rules import TriggerRules
 from .transaction import CommitResult
 
 __version__ = "0.1.0"
-__all__ = ["Database", "Archives", "Record", "Page", "CommitResult", "DatabaseError",
-           "InvalidDocument", "Conflict", "NotFound", "SnapshotTooOld", "InvalidCursor", "ReadOnly", "ReplicationError"]
+__all__ = ["Database", "Archives", "Record", "Page", "CommitResult", "TriggerRules",
+           "DatabaseError", "InvalidDocument", "Conflict", "NotFound", "SnapshotTooOld",
+           "InvalidCursor", "ReadOnly", "ReplicationError"]

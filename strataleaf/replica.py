@@ -16,9 +16,13 @@ class Replication:
             commits = [loads(row[0]) for row in connection.execute("SELECT payload FROM commits WHERE rev>? ORDER BY rev LIMIT ?", (since, limit))]
             body = {"format": 1, "source": self.store.get("database_id"), "since": since,
                 "through": commits[-1]["revision"] if commits else since,
-                "catalog_epoch": int(self.store.get("catalog_epoch")), "head": int(self.store.get("head")), "floor": int(self.store.get("floor")),
+                "catalog_epoch": int(self.store.get("catalog_epoch")),
+                "rule_epoch": int(self.store.get("rule_epoch")),
+                "head": int(self.store.get("head")), "floor": int(self.store.get("floor")),
                 "collections": [dict(row) for row in connection.execute("SELECT * FROM collections ORDER BY name")],
                 "indexes": [dict(row) for row in connection.execute("SELECT * FROM index_defs ORDER BY collection,name")],
+                "rules": [dict(row) for row in connection.execute("SELECT * FROM rule_versions ORDER BY rule_name,version")],
+                "rule_registry": [dict(row) for row in connection.execute("SELECT * FROM rule_registry ORDER BY rule_name")],
                 "commits": commits}
             return {"body": body, "sha256": digest(body)}
 
@@ -31,26 +35,46 @@ class Replication:
             expected = list(range(body["since"] + 1, body["through"] + 1))
             if [item["revision"] for item in commits] != expected or body["through"] > body["head"]:
                 raise ReplicationError("replication envelope has a revision gap")
+            # Older envelopes predate the rule catalog; treat them as empty.
+            rule_epoch = body.get("rule_epoch", 0)
             with self.store.atomic() as connection:
                 if self.store.get("mode") != "replica" or self.store.get("upstream") != body["source"]:
                     raise ReplicationError("envelope does not match configured upstream")
                 head = int(self.store.get("head"))
                 if body["since"] > head:
                     raise ReplicationError("missing preceding replication range")
-                if body["through"] < head or (body["through"] == head and body["catalog_epoch"] <= int(self.store.get("catalog_epoch"))):
+                local_catalog_epoch = int(self.store.get("catalog_epoch"))
+                local_rule_epoch = int(self.store.get("rule_epoch"))
+                metadata_stale = (body["catalog_epoch"] > local_catalog_epoch
+                                  or rule_epoch > local_rule_epoch)
+                if body["through"] < head or (body["through"] == head and not metadata_stale):
                     return {"revision": head, "applied": 0}
+                caught_up = body["through"] == body["head"]
                 for definition in body["collections"]:
                     connection.execute("INSERT INTO collections VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET schema=excluded.schema,generation=excluded.generation",
                                        (definition["name"], definition["schema"], definition["generation"]))
                 connection.execute("DELETE FROM index_values")
                 connection.execute("DELETE FROM index_defs")
-                for definition in body["indexes"] if body["through"] == body["head"] else []:
+                for definition in body["indexes"] if caught_up else []:
                     connection.execute("INSERT INTO index_defs VALUES (?,?,?,?)", (definition["collection"], definition["name"], definition["field"], definition["unique_flag"]))
+                # Rule catalog is metadata like collections/indexes: install the
+                # upstream versions but never execute rules on the replica.
+                connection.execute("DELETE FROM rule_registry")
+                connection.execute("DELETE FROM rule_versions")
+                for version in body.get("rules", []):
+                    connection.execute("INSERT INTO rule_versions VALUES (?,?,?,?,?)",
+                                       (version["rule_name"], version["version"], version["body"],
+                                        version["state"], version["rule_epoch"]))
+                for entry in body.get("rule_registry", []):
+                    connection.execute("INSERT INTO rule_registry VALUES (?,?)",
+                                       (entry["rule_name"], entry["current_version"]))
                 applied = 0
                 for commit in commits:
                     revision = commit["revision"]
                     if revision <= head:
                         continue
+                    # The payload already contains materialized derived operations
+                    # with origin metadata, so replay cannot regenerate them.
                     for operation in commit["operations"]:
                         document = operation["document"]
                         connection.execute("INSERT INTO versions VALUES (?,?,?,?,?)", (operation["collection"], operation["key"], revision,
@@ -58,7 +82,8 @@ class Replication:
                     connection.execute("INSERT INTO commits(rev,payload) VALUES (?,?)", (revision, dumps(commit)))
                     applied += 1
                 self.store.set("head", body["through"])
-                self.store.set("catalog_epoch", body["catalog_epoch"] if body["through"] == body["head"] else -1)
+                self.store.set("catalog_epoch", body["catalog_epoch"] if caught_up else -1)
+                self.store.set("rule_epoch", rule_epoch if caught_up else -1)
                 from .mvcc import visible_rows
                 for collection in connection.execute("SELECT name FROM collections").fetchall():
                     for row in visible_rows(connection, collection[0], body["through"]):

@@ -1,10 +1,8 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from .codec import digest, dumps, key as checked_key, loads, name
-from .errors import Conflict, InvalidDocument, NotFound
-from .indexes import refresh_document
-from .mvcc import latest_row
-from .schema import validate_document
+from .errors import Conflict, InvalidDocument
+from .triggers import TriggerEngine
 
 
 @dataclass(frozen=True)
@@ -12,6 +10,8 @@ class CommitResult:
     revision: int
     count: int
     replayed: bool = False
+    derived: int = 0
+    trace: tuple = field(default_factory=tuple)
 
 
 class WriteBatch:
@@ -58,6 +58,8 @@ class WriteBatch:
             raise Conflict("batch is already " + self.state)
         if not self.operations or len(self.operations) > 10000:
             raise InvalidDocument("batch must contain between 1 and 10000 operations")
+        user_operations = [{**op, "action": "upsert" if op["document"] is not None else "delete",
+                            "origin": None} for op in self.operations]
         fingerprint = digest(self.operations)
         try:
             with self.store.atomic(writable=True) as connection:
@@ -67,32 +69,33 @@ class WriteBatch:
                         if prior["request_hash"] != fingerprint:
                             raise Conflict("request key was used with different operations")
                         self.state = "committed"
-                        return CommitResult(prior["rev"], prior["count"], True)
+                        # The commit payload may have been reaped by retention, but
+                        # receipts survive and remain the authoritative replay record.
+                        logged = connection.execute("SELECT payload FROM commits WHERE rev=?",
+                                                    (prior["rev"],)).fetchone()
+                        if logged is not None:
+                            payload = loads(logged[0])
+                            derived, trace = payload.get("derived", 0), tuple(payload.get("trace", ()))
+                        else:
+                            derived, trace = 0, ()
+                        return CommitResult(prior["rev"], prior["count"], True, derived, trace)
                 head = int(self.store.get("head"))
-                for op in self.operations:
-                    schema = connection.execute("SELECT schema FROM collections WHERE name=?", (op["collection"],)).fetchone()
-                    if schema is None:
-                        raise NotFound("unknown collection: " + op["collection"])
-                    old = latest_row(connection, op["collection"], op["key"], head)
-                    current = old["rev"] if old is not None else 0
-                    if op["expected"] is not None and op["expected"] != current:
-                        raise Conflict(f"revision conflict for {op['collection']}/{op['key']}: expected {op['expected']}, found {current}")
-                    if op["document"] is not None:
-                        validate_document(op["document"], loads(schema[0]))
+                # Rule propagation runs on the same connection before any row is
+                # written, so schema/unique/depth failures leave nothing behind.
+                engine = TriggerEngine(connection, self.store)
+                derived, trace = engine.run(user_operations)
                 revision = head + 1
-                for op in self.operations:
-                    body = dumps(op["document"]) if op["document"] is not None else None
-                    connection.execute("INSERT INTO versions VALUES (?,?,?,?,?)",
-                                       (op["collection"], op["key"], revision, body, op["expires_at"]))
-                    refresh_document(connection, op["collection"], op["key"], op["document"])
-                payload = {"revision": revision, "operations": self.operations}
+                all_operations = engine.apply(revision, head, user_operations + derived)
+                payload = {"revision": revision, "operations": all_operations,
+                           "user_count": len(self.operations), "derived": len(derived), "trace": trace}
                 connection.execute("INSERT INTO commits VALUES (?,?,?,?)",
                                    (revision, dumps(payload), self.request_key, fingerprint))
                 if self.request_key is not None:
-                    connection.execute("INSERT INTO receipts VALUES (?,?,?,?)", (self.request_key, revision, fingerprint, len(self.operations)))
+                    connection.execute("INSERT INTO receipts VALUES (?,?,?,?)",
+                                       (self.request_key, revision, fingerprint, len(self.operations)))
                 self.store.set("head", revision)
         except BaseException:
             self.state = "aborted"
             raise
         self.state = "committed"
-        return CommitResult(revision, len(self.operations))
+        return CommitResult(revision, len(self.operations), False, len(derived), tuple(trace))

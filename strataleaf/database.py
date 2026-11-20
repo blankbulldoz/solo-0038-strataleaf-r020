@@ -9,6 +9,7 @@ from .patch import patch_document
 from .query import QueryEngine
 from .replica import Replication
 from .retention import Retention
+from .rules import TriggerRules
 from .storage import Storage
 from .transaction import WriteBatch
 from .transfer import Transfer
@@ -27,6 +28,7 @@ class Database:
         self.aggregates = Aggregates(self._store)
         self.transfer = Transfer(self._store)
         self.diagnostics = Diagnostics(self._store)
+        self.rules = TriggerRules(self._store)
         self._queries = QueryEngine(self._store)
 
     @property

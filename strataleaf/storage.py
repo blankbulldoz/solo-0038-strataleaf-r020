@@ -24,6 +24,13 @@ CREATE TABLE IF NOT EXISTS index_values (
 CREATE INDEX IF NOT EXISTS index_document ON index_values(collection,key);
 CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS rule_versions (
+ rule_name TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL,
+ state TEXT NOT NULL, rule_epoch INTEGER NOT NULL,
+ PRIMARY KEY(rule_name,version));
+CREATE TABLE IF NOT EXISTS rule_registry (
+ rule_name TEXT PRIMARY KEY, current_version INTEGER NOT NULL,
+ FOREIGN KEY(rule_name,current_version) REFERENCES rule_versions(rule_name,version));
 """
 
 
@@ -40,7 +47,8 @@ class Storage:
         self.connection.executescript(DDL)
         with self.atomic():
             initial = {"format": "1", "head": "0", "floor": "0", "database_id": str(uuid.uuid4()),
-                       "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "", "catalog_epoch": "0"}
+                       "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "",
+                       "catalog_epoch": "0", "rule_epoch": "0"}
             for key, value in initial.items():
                 self.connection.execute("INSERT OR IGNORE INTO meta VALUES (?,?)", (key, value))
             if self.get("format") != "1":
